@@ -19,13 +19,20 @@ num_proc_load_dataset = num_proc
 enc = tiktoken.get_encoding("gpt2")
 
 if __name__ == '__main__':
+    print("starting openwebtext dataset download")
+    print(f"using {num_proc_load_dataset} processes for dataset loading")
     # takes 54GB in huggingface .cache dir, about 8M documents (8,013,769)
     dataset = load_dataset("openwebtext", num_proc=num_proc_load_dataset)
-
+    
+    print(f"Dataset loaded successfully. Number of documents: {len(dataset['train'])}")
+    print("Creating train/validation split...")
     # owt by default only contains the 'train' split, so create a test split
     split_dataset = dataset["train"].train_test_split(test_size=0.0005, seed=2357, shuffle=True)
     split_dataset['val'] = split_dataset.pop('test') # rename the test split to val
 
+    print("Split created:")
+    print(f"  - Train: {len(split_dataset['train'])} documents")
+    print(f"  - Validation: {len(split_dataset['val'])} documents")
     # this results in:
     # >>> split_dataset
     # DatasetDict({
@@ -47,6 +54,8 @@ if __name__ == '__main__':
         out = {'ids': ids, 'len': len(ids)}
         return out
 
+    print(f"Starting tokenization with {num_proc} processes...")
+
     # tokenize the dataset
     tokenized = split_dataset.map(
         process,
@@ -55,11 +64,18 @@ if __name__ == '__main__':
         num_proc=num_proc,
     )
 
+    print("Tokenization complete. Writing binary files...")
+
     # concatenate all the ids in each dataset into one large file we can use for training
     for split, dset in tokenized.items():
         arr_len = np.sum(dset['len'], dtype=np.uint64)
         filename = os.path.join(os.path.dirname(__file__), f'{split}.bin')
         dtype = np.uint16 # (can do since enc.max_token_value == 50256 is < 2**16)
+
+        print(f"Writing {split} split to {filename}")
+        print(f"  - Total tokens: {arr_len:,}")
+        print(f"  - File size: ~{arr_len * 2 / (1024**3):.2f} GB")
+
         arr = np.memmap(filename, dtype=dtype, mode='w+', shape=(arr_len,))
         total_batches = 1024
 
@@ -72,8 +88,12 @@ if __name__ == '__main__':
             arr[idx : idx + len(arr_batch)] = arr_batch
             idx += len(arr_batch)
         arr.flush()
+        print(f"Finished writing {filename}")
 
-    # train.bin is ~17GB, val.bin ~8.5MB
+    print("All files written successfully!")
+    print("Final summary:")
+    print("  - train.bin: ~17GB, ~9B tokens")
+    print("  - val.bin: ~8.5MB, ~4M tokens") # train.bin is ~17GB, val.bin ~8.5MB
     # train has ~9B tokens (9,035,582,198)
     # val has ~4M tokens (4,434,897)
 
