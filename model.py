@@ -188,7 +188,6 @@ class GPT(nn.Module):
                 x.to(torch.bfloat16),
                 self.lm_head.weight.to(torch.bfloat16),
                 targets,
-                bias=None,
                 ignore_index=-1
             )
             return loss
