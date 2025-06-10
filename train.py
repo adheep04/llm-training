@@ -12,7 +12,7 @@ import numpy as np
 import torch
 
 import tiktoken
-from model import GPTConfig, GPT
+from model import  GPT, GPTConfig
 from dataclasses import dataclass
 
 # -----------------------------------------------------------------------------
@@ -29,6 +29,7 @@ class TrainConfig():
     init_from = 'scratch' # 'scratch' or 'resume' or 'gpt2*'
     # logging
     log_interval = 1
+    log_text_interval = 20
     log_time = True
     wandb_log = False # disabled by default
     wandb_project = 'owt'
@@ -36,7 +37,7 @@ class TrainConfig():
     log_input_text = True
     # data
     dataset = 'openwebtext'
-    gradient_accumulation_steps = 5 * 8 # used to simulate larger batch sizes
+    gradient_accumulation_steps = 4 # used to simulate larger batch sizes
     batch_size = 12 # if gradient_accumulation_steps > 1, this is the micro-batch size
     block_size = 1024
     # model
@@ -58,7 +59,7 @@ class TrainConfig():
     lr_decay_steps = 600000 # should be ~= max_steps per Chinchilla
     min_lr = 6e-5 #  should be ~= learning_rate/10 per Chinchilla
     # training
-    cce = True
+    cce = False
     training: bool = True
     # system
     device = 'cuda'
@@ -124,7 +125,6 @@ def main(train_args):
     torch.backends.cuda.matmul.allow_tf32 = True # allow tf32 on matmul
     torch.backends.cudnn.allow_tf32 = True # allow tf32 on cudnn
     device_type = 'cuda' if 'cuda' in args.device else 'cpu' # for later use in torch.autocast
-    # note: float16 data type will automatically use a GradScaler
     ptdtype = {'float32': torch.float32, 'bfloat16': torch.bfloat16, 'float16': torch.float16}[args.dtype]
     ctx = nullcontext() if device_type == 'cpu' else torch.amp.autocast(device_type=device_type, dtype=ptdtype)
 
@@ -218,7 +218,6 @@ def main(train_args):
         if args.wandb_log:
             import wandb
             wandb.init(project=args.wandb_project, name=args.wandb_run_name, config=config)
-
         # -----------------------------------------------------------------------------
 
         X, Y = get_batch(args, 'train', data_dir, device_type) # fetch the very first batch
@@ -227,8 +226,6 @@ def main(train_args):
         local_step_num = 0 # number of iterations in the lifetime of this process
         raw_model = model # unwrap DDP container if needed
         enc = tiktoken.get_encoding("gpt2")
-        decode = lambda l: enc.decode(l)
-
         running_mfu = -1.0
         tokens_per_iter = args.gradient_accumulation_steps * args.batch_size * args.block_size
         print(f"tokens per iteration will be: {tokens_per_iter:,}")
@@ -270,21 +267,20 @@ def main(train_args):
                         torch.save(checkpoint, os.path.join(args.out_dir, 'ckpt.pt'))
             if step_num == 0 and args.eval_only:
                 break
-
             # -----------------------------------------------------------------------------
             # training
 
             # forward backward update, with optional gradient accumulation to simulate larger batch size
             for micro_step in range(args.gradient_accumulation_steps):
                 with ctx:
-                    loss = model(X, Y)
+                    logits, loss = model(X, Y)
+                    if micro_step == 0 and step_num == 0: import code; code.interact(local=locals())
                     loss = loss / args.gradient_accumulation_steps # scale the loss to account for gradient accumulation
                 # immediately async prefetch next batch while model is doing the forward pass on the GPU
                 X, Y = get_batch(args, 'train', data_dir, device_type)
                 # backward pass, with gradient scaling if training in fp16
                 loss.backward()
             # clip the gradient
-            # import code; code.interact(local=locals())
             if args.grad_clip != 0.0:
                 torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
             # step the optimizer and scaler if training in fp16
@@ -299,16 +295,18 @@ def main(train_args):
                 dt = t1 - t0
                 t0 = t1
             else:
-                dt
+                dt = None
             if step_num % args.log_interval == 0:
                 # get loss as float. note: this is a CPU-GPU sync point
                 # scale up to undo the division above, approximating the true total loss (exact would have been a sum)
                 lossf = loss.item() * args.gradient_accumulation_steps
                 mfu = raw_model.estimate_mfu(args.batch_size * args.gradient_accumulation_steps, dt)
                 running_mfu = mfu if running_mfu == -1.0 else 0.9*running_mfu + 0.1*mfu
+
                 time_str = f"{dt*1000:.2f}" if dt else "N/A"
                 print(f"step {step_num}: loss {lossf:.4f}, time {time_str}ms, mfu {running_mfu*100:.2f}%")
-            if step_num % args.
+            if step_num % args.log_text_interval == 0:
+                print(enc.decode((Y[0]).tolist()))
             step_num += 1
             local_step_num += 1
 

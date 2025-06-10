@@ -27,7 +27,7 @@ class GPTConfig:
     dropout: float = 0.0
     bias: bool = False # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
     training: bool = True
-    cce: bool = True
+    cce: bool = False
 
 class GPT(nn.Module):
     def __init__(self, config):
@@ -112,7 +112,7 @@ class GPT(nn.Module):
             return loss
         else:
             logits = self.lm_head(x)
-            loss = F.cross_entropy(x, targets, ignore_index=-1)
+            loss = F.cross_entropy(logits, targets, ignore_index=-1)
             return logits, loss
 
     def crop_block_size(self, block_size):
