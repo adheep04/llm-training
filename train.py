@@ -9,16 +9,17 @@ import pickle
 from contextlib import nullcontext
 
 import numpy as np
-import torch
 
+import torch
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+
+import transformers
 import tiktoken
-from model import  GPT, GPTConfig
+from model import GPT #, GPTConfig
 from dataclasses import dataclass
+# import torch._dynamo as dynamo
 
 # -----------------------------------------------------------------------------
-# default config values designed to train a gpt2 (124M) on OpenWebText
-# I/O
-
 @dataclass
 class TrainConfig():
     eval_interval = 2000
@@ -27,44 +28,55 @@ class TrainConfig():
     eval_only = False # if True, script exits right after the first eval
     always_save_checkpoint = True # if True, always save a checkpoint after each eval
     init_from = 'scratch' # 'scratch' or 'resume' or 'gpt2*'
+    begin_with_eval = False
+
     # logging
     log_interval = 1
-    log_text_interval = 20
     log_time = True
-    wandb_log = False # disabled by default
+    wandb_log = False
     wandb_project = 'owt'
     wandb_run_name = 'gpt2' # 'run' + str(time.time())
     log_input_text = True
+    log_text_interval = 200
+    log_text_length = 400
+
     # data
     dataset = 'openwebtext'
-    gradient_accumulation_steps = 4 # used to simulate larger batch sizes
-    batch_size = 12 # if gradient_accumulation_steps > 1, this is the micro-batch size
+    gradient_accumulation_steps = 8 
+    batch_size = 16 
     block_size = 1024
+
     # model
     n_layer = 12
     n_head = 12
-    n_embd = 768
+    d_model = 768
     dropout = 0.0 # for pretraining 0 is good, for finetuning try 0.1+
-    bias = False # do we use bias inside LayerNorm and Linear layers?
+    bias = False 
+    vocab_size = 50304 # GPT-2 vocab_size of 50257, padded up to nearest multiple of 64 for efficiency
+    is_inference = False
+
     # adamw optimizer
-    learning_rate = 6e-4 # max learning rate
     max_steps = 600000 # total number of training steps
+    learning_rate = 3e-3 # max learning rate
     weight_decay = 1e-1
     beta1 = 0.9
     beta2 = 0.95
     grad_clip = 1.0 # disable if == 0.0
+
     # learning rate decay settings
     decay_lr = True 
     warmup_steps = 2000 
     lr_decay_steps = 600000 # should be ~= max_steps per Chinchilla
-    min_lr = 6e-5 #  should be ~= learning_rate/10 per Chinchilla
+    min_lr = 1e-4 #  should be ~= learning_rate/10 per Chinchilla
+
     # training
-    cce = False
-    training: bool = True
+    cce = True
+    training = True
+
     # system
     device = 'cuda'
     dtype = 'bfloat16' if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else 'float16' 
-    compile = False
+    compile = True
 
 # -----------------------------------------------------------------------------
 def get_batch(args, split, data_dir, device_type):
@@ -115,11 +127,10 @@ def get_lr(args, it):
     return args.min_lr + coeff * (args.learning_rate - args.min_lr)
 
 # -----------------------------------------------------------------------------
-
 def main(train_args):
     args = train_args
-    seed_offset = 0
-    torch.manual_seed(1337 + seed_offset)
+    # seed_offset = 1
+    # torch.manual_seed(1337 + seed_offset)
 
     os.makedirs(args.out_dir, exist_ok=True)
     torch.backends.cuda.matmul.allow_tf32 = True # allow tf32 on matmul
@@ -130,7 +141,6 @@ def main(train_args):
 
     # poor man's data loader
     data_dir = os.path.join('data', args.dataset)
-
 
     # attempt to derive vocab_size from the dataset
     meta_path = os.path.join(data_dir, 'meta.pkl')
@@ -146,7 +156,7 @@ def main(train_args):
         n_layer=args.n_layer, 
         n_head=args.n_head, 
         block_size=args.block_size,
-        n_embd=args.n_embd, 
+        d_model=args.d_model, 
         bias=args.bias,
         vocab_size=None, 
         dropout=args.dropout
@@ -160,8 +170,7 @@ def main(train_args):
             if meta_vocab_size is None:
                 print("defaulting to vocab_size of GPT-2 to 50304 (50257 rounded up for efficiency)")
             model_args['vocab_size'] = meta_vocab_size if meta_vocab_size is not None else 50304
-            gptconf = GPTConfig(**model_args)
-            model = GPT(gptconf)
+            model = GPT(args)
 
         elif args.init_from == 'resume':
             print(f"Resuming training from {args.out_dir}")
@@ -171,11 +180,10 @@ def main(train_args):
             checkpoint_model_args = checkpoint['model_args']
             # force these config attributes to be equal otherwise we can't even resume training
             # the rest of the attributes (e.g. dropout) can stay as desired from command line
-            for k in ['n_layer', 'n_head', 'n_embd', 'block_size', 'bias', 'vocab_size']:
+            for k in ['n_layer', 'n_head', 'd_model', 'block_size', 'bias', 'vocab_size']:
                 model_args[k] = checkpoint_model_args[k]
             # create the model
-            gptconf = GPTConfig(**model_args)
-            model = GPT(gptconf)
+            model = GPT(args)
             state_dict = checkpoint['model']
             # fix the keys of the state dictionary :(
             # honestly no idea how checkpoints sometimes get this prefix, have to debug more
@@ -184,23 +192,15 @@ def main(train_args):
                 if k.startswith(unwanted_prefix):
                     state_dict[k[len(unwanted_prefix):]] = state_dict.pop(k)
             model.load_state_dict(state_dict)
-            step_num = checkpoint['step_num']
+            step = checkpoint['step']
             best_val_loss = checkpoint['best_val_loss']
 
-        elif args.init_from.startswith('gpt2'):
-            print(f"Initializing from OpenAI GPT-2 weights: {args.init_from}")
-            # initialize from OpenAI GPT-2 weights
-            override_args = dict(dropout=args.dropout)
-            model = GPT.from_pretrained(args.init_from, override_args)
-            # read off the created config params, so we can store them into checkpoint correctly
-            for k in ['n_layer', 'n_head', 'n_embd', 'block_size', 'bias', 'vocab_size']:
-                model_args[k] = getattr(model.config, k)
 
         # crop down the model block size if desired, using model surgery
         if args.block_size < model.config.block_size:
             model.crop_block_size(args.block_size)
             model_args['block_size'] = args.block_size # so that the checkpoint will have the right value
-        model.to(args.device)
+        model.to(args.device).to(dtype=ptdtype)
 
         # optimizer
         optimizer = model.configure_optimizers(args.weight_decay, args.learning_rate, (args.beta1, args.beta2), device_type)
@@ -209,44 +209,58 @@ def main(train_args):
         checkpoint = None # free up memory
 
         # compile the model
-        if compile:
+        if args.compile:
             print("compiling the model... (takes a ~minute)")
-            args.unoptimized_model = model
-            model = torch.compile(model) # requires PyTorch 2.0
+            unoptimized_model = model
+            model = torch.compile(model)
 
         # logging
         if args.wandb_log:
             import wandb
             wandb.init(project=args.wandb_project, name=args.wandb_run_name, config=config)
-        # -----------------------------------------------------------------------------
 
+        # -----------------------------------------------------------------------------
         X, Y = get_batch(args, 'train', data_dir, device_type) # fetch the very first batch
         if args.log_time: 
             t0 = time.time() 
-        local_step_num = 0 # number of iterations in the lifetime of this process
+        local_step = 0 # number of iterations in the lifetime of this process
         raw_model = model # unwrap DDP container if needed
         enc = tiktoken.get_encoding("gpt2")
         running_mfu = -1.0
-        tokens_per_iter = args.gradient_accumulation_steps * args.batch_size * args.block_size
-        print(f"tokens per iteration will be: {tokens_per_iter:,}")
+        tokens_per_step = args.gradient_accumulation_steps * args.batch_size * args.block_size
+        print(f"tokens per macro-step will be: {tokens_per_step:,}")
 
         # init these up here, can override if init_from='resume' (i.e. from a checkpoint)
-        step_num = 0
+        step = 0
         best_val_loss = 1e9
 
         while True:
             # determine and set the learning rate for this step
-            lr = get_lr(args, step_num) if args.decay_lr else args.learning_rate
+            lr = get_lr(args, step) if args.decay_lr else args.learning_rate
             for param_group in optimizer.param_groups:
                 param_group['lr'] = lr
 
             # evaluate the loss on train/val sets and write checkpoints
-            if step_num % args.eval_interval == 0 and step_num != 0:
-                losses = estimate_loss(args, model, ctx, data_dir, device_type)
-                print(f"step {step_num}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
+            if step % args.eval_interval == 0 and (step != 0 or args.begin_with_eval):
+                with torch.no_grad():
+                    losses = {}
+                    model.eval()
+                    for split in ['train', 'val']:
+                        batch_losses = torch.zeros(args.eval_steps)
+                        for k in range(args.eval_steps):
+                            X, Y = get_batch(args, split, data_dir, device_type)
+                            if args.cce:
+                                loss = model(X, Y)
+                            else:
+                                logits, loss = model(X, Y)
+                            batch_losses[k] = loss.item()
+                        losses[split] = batch_losses.mean()
+                    model.train()
+
+                print(f"step {step}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
                 if args.wandb_log:
                     wandb.log({
-                        "step": step_num,
+                        "step": step,
                         "train/loss": losses['train'],
                         "val/loss": losses['val'],
                         "lr": lr,
@@ -254,18 +268,18 @@ def main(train_args):
                     })
                 if losses['val'] < best_val_loss or args.always_save_checkpoint:
                     best_val_loss = losses['val']
-                    if step_num > 0:
+                    if step > 0:
                         checkpoint = {
                             'model': raw_model.state_dict(),
                             'optimizer': optimizer.state_dict(),
                             'model_args': model_args,
-                            'step_num': step_num,
+                            'step': step,
                             'best_val_loss': best_val_loss,
                             'config': config,
                         }
                         print(f"saving checkpoint to {args.out_dir}")
                         torch.save(checkpoint, os.path.join(args.out_dir, 'ckpt.pt'))
-            if step_num == 0 and args.eval_only:
+            if step == 0 and args.eval_only:
                 break
             # -----------------------------------------------------------------------------
             # training
@@ -273,8 +287,18 @@ def main(train_args):
             # forward backward update, with optional gradient accumulation to simulate larger batch size
             for micro_step in range(args.gradient_accumulation_steps):
                 with ctx:
-                    logits, loss = model(X, Y)
-                    if micro_step == 0 and step_num == 0: import code; code.interact(local=locals())
+                    # cce doesn't materialize raw logits
+                    if args.cce:
+                        loss = model(X, Y)
+                    else:
+                        logits, loss = model(X, Y)
+                    if micro_step == 0 and step % args.log_text_interval == 0:
+                        print("\n----- GROUND-TRUTH -----")
+                        print(enc.decode((Y[0]).tolist())[:300], "\n")  # First 100 chars
+                        if not args.cce and 'logits' in locals():
+                            print("\n----- PREDICTED -----")
+                            print(enc.decode((logits[0,:,:50257].argmax(dim=-1)).tolist())[:300])
+                        print("-" * 40)
                     loss = loss / args.gradient_accumulation_steps # scale the loss to account for gradient accumulation
                 # immediately async prefetch next batch while model is doing the forward pass on the GPU
                 X, Y = get_batch(args, 'train', data_dir, device_type)
@@ -294,28 +318,39 @@ def main(train_args):
                 t1 = time.time()
                 dt = t1 - t0
                 t0 = t1
+                mfu = raw_model.estimate_mfu(args.batch_size * args.gradient_accumulation_steps, dt)
+                running_mfu = mfu if running_mfu == -1.0 else 0.9*running_mfu + 0.1*mfu
+                time_str = f"{dt*1000:.2f}" 
+                tokens_per_sec = f"{tokens_per_step / dt:.2f}" 
             else:
                 dt = None
-            if step_num % args.log_interval == 0:
+                tokens_per_sec = "N/A"
+                time_str = "N/A"
+            if step % args.log_interval == 0:
                 # get loss as float. note: this is a CPU-GPU sync point
                 # scale up to undo the division above, approximating the true total loss (exact would have been a sum)
                 lossf = loss.item() * args.gradient_accumulation_steps
-                mfu = raw_model.estimate_mfu(args.batch_size * args.gradient_accumulation_steps, dt)
-                running_mfu = mfu if running_mfu == -1.0 else 0.9*running_mfu + 0.1*mfu
-
-                time_str = f"{dt*1000:.2f}" if dt else "N/A"
-                print(f"step {step_num}: loss {lossf:.4f}, time {time_str}ms, mfu {running_mfu*100:.2f}%")
-            if step_num % args.log_text_interval == 0:
-                print(enc.decode((Y[0]).tolist()))
-            step_num += 1
-            local_step_num += 1
+                print(f"step {step}: loss {lossf:.4f}, time {time_str} ms/step, {tokens_per_sec} tokens/s, mfu {running_mfu*100:.2f}%")
+            step += 1
+            local_step += 1
 
             # termination conditions
-            if step_num > args.max_steps:
+            if step > args.max_steps:
                 break
+
     except(KeyboardInterrupt):
         print("key exit")
                 
+    checkpoint = {
+        'model': raw_model.state_dict(),
+        'optimizer': optimizer.state_dict(),
+        'model_args': model_args,
+        'step': step,
+        'best_val_loss': best_val_loss,
+        'config': config,
+    }
+    print(f"saving checkpoint to {args.out_dir}")
+    torch.save(checkpoint, os.path.join(args.out_dir, 'ckpt.pt'))
 
 if __name__ == '__main__':
     # -----------------------------------------------------------------------------
@@ -323,6 +358,7 @@ if __name__ == '__main__':
     exec(open('configurator.py').read()) # overrides from command line or config file
     config = {k: globals()[k] for k in config_keys} # will be useful for logging
     # -----------------------------------------------------------------------------
+    # dynamo.config.capture_dynamic_output_shape_ops = True
     train_config = TrainConfig()
     print(train_config)
     main(train_config)
