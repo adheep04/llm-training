@@ -1,0 +1,198 @@
+# Native Sparse Attention Integration Guide
+
+## Overview
+Native Sparse Attention (NSA) is a hardware-aligned sparse attention mechanism that maintains efficiency while providing the expressiveness of traditional attention. It combines three attention patterns: compressed attention, selected attention, and sliding window attention.
+
+## Key Features
+- **Causal Masking**: Yes, NSA inherently supports causal masking for autoregressive language modeling
+- **Sparse Selection**: Dynamically selects important blocks using top-k selection
+- **Hardware Optimized**: Triton kernels optimized for modern GPU architectures
+- **Variable Length Support**: Handles variable-length sequences with cu_seqlens
+- **Memory Efficient**: Reduces memory usage through block-based sparse attention
+
+## Quick Integration
+
+### 1. Basic NSA Layer Usage
+```python
+import torch
+from native_sparse_attention.modeling_nsa import NativeSparseAttention
+
+# Initialize NSA layer
+attn = NativeSparseAttention(
+    hidden_size=2048,
+    num_heads=64,
+    num_kv_heads=4,
+    head_dim=64,
+    block_size=64,
+    block_counts=16,
+    window_size=512
+)
+
+# Forward pass
+hidden_states = torch.randn(4, 1024, 2048).cuda()  # [batch, seq_len, hidden_size]
+output, _, _ = attn(hidden_states)
+```
+
+### 2. Complete Language Model
+```python
+from native_sparse_attention.modeling_nsa import NSAForCausalLM
+from native_sparse_attention.configuration_nsa import NSAConfig
+
+# Create configuration
+config = NSAConfig(
+    hidden_size=1024,
+    num_hidden_layers=24,
+    num_heads=32,
+    num_kv_heads=2,
+    head_dim=64,
+    block_size=64,
+    block_counts=16,
+    window_size=512,
+    vocab_size=32000,
+    max_position_embeddings=8192
+)
+
+# Initialize model
+model = NSAForCausalLM(config)
+
+# Training/inference
+input_ids = torch.randint(0, 32000, (4, 512)).cuda()
+outputs = model(input_ids, labels=input_ids)
+loss = outputs.loss
+```
+
+### 3. Direct Kernel Usage
+```python
+from native_sparse_attention.ops.parallel import parallel_nsa
+
+B, T, HQ, H, D = 4, 2048, 64, 4, 64
+block_size = 64
+window_size = 512
+
+# Prepare inputs
+q = torch.randn(B, T, HQ, D, device='cuda').requires_grad_(True)
+k = torch.randn(B, T, H, D, device='cuda').requires_grad_(True)
+v = torch.randn(B, T, H, D, device='cuda').requires_grad_(True)
+
+# Gate scores (sigmoid activated)
+g_cmp = torch.rand(B, T, HQ, device='cuda')  # compression gate
+g_slc = torch.rand(B, T, HQ, device='cuda')  # selection gate
+g_swa = torch.rand(B, T, HQ, device='cuda')  # sliding window gate
+
+# Run NSA
+output = parallel_nsa(
+    q=q, k=k, v=v,
+    g_cmp=g_cmp,
+    g_slc=g_slc,
+    g_swa=g_swa,
+    block_counts=16,
+    block_size=block_size,
+    window_size=window_size
+)
+```
+
+## Configuration Parameters
+
+### Core Attention Parameters
+- `block_size`: Size of each attention block (default: 64)
+- `block_counts`: Number of blocks to select per query (default: 16)
+- `window_size`: Sliding window size for local attention (default: 512)
+- `num_heads`: Number of query heads
+- `num_kv_heads`: Number of key/value heads (for GQA)
+- `head_dim`: Dimension per attention head
+
+### Model Architecture
+- `hidden_size`: Model hidden dimension
+- `num_hidden_layers`: Number of transformer layers
+- `vocab_size`: Vocabulary size
+- `max_position_embeddings`: Maximum sequence length
+
+### Optimization Flags
+- `fuse_norm`: Use fused RMSNorm (default: True)
+- `fuse_swiglu`: Use fused SwiGLU activation (default: True)
+- `fuse_cross_entropy`: Use fused cross-entropy loss (default: True)
+
+## Causal Masking Details
+
+NSA implements causal masking at multiple levels:
+
+1. **Block-level Causal Masking**: Only blocks with positions ≤ current position are considered
+2. **Token-level Causal Masking**: Within selected blocks, only tokens ≤ current position attend
+3. **Sliding Window**: Maintains causal property with efficient local attention
+
+```python
+# Causal masking is automatic - no additional configuration needed
+# The following line in the kernel ensures causality:
+# b_s = tl.where((i_t >= (i_s + tl.arange(0, BS)))[None, :], b_s, float('-inf'))
+```
+
+## Variable Length Sequences
+
+For training with packed sequences:
+
+```python
+# Prepare cumulative sequence lengths
+cu_seqlens = torch.tensor([0, 128, 384, 512]).cuda()  # 3 sequences of lengths 128, 256, 128
+
+# Packed input (batch_size=1, total_length=512)
+q = torch.randn(1, 512, 64, 64).cuda()
+k = torch.randn(1, 512, 4, 64).cuda()
+v = torch.randn(1, 512, 4, 64).cuda()
+
+output = parallel_nsa(
+    q=q, k=k, v=v,
+    g_cmp=g_cmp, g_slc=g_slc, g_swa=g_swa,
+    cu_seqlens=cu_seqlens,
+    block_size=64,
+    window_size=128
+)
+```
+
+## Performance Considerations
+
+1. **Block Size**: 64 is optimal for most modern GPUs
+2. **Selection Count**: 16 blocks provides good accuracy/efficiency trade-off
+3. **Window Size**: 512 tokens balances local context and efficiency
+4. **GQA**: Use num_kv_heads < num_heads for memory efficiency
+5. **Group Size**: Ensure num_heads % (num_kv_heads * 16) == 0
+
+## Training Integration
+
+```python
+from transformers import Trainer, TrainingArguments
+
+# Standard Hugging Face training workflow
+training_args = TrainingArguments(
+    output_dir="./nsa-model",
+    per_device_train_batch_size=4,
+    gradient_accumulation_steps=16,
+    warmup_steps=1000,
+    max_steps=10000,
+    learning_rate=5e-4,
+    dataloader_num_workers=4,
+    gradient_checkpointing=True
+)
+
+trainer = Trainer(
+    model=model,
+    args=training_args,
+    train_dataset=train_dataset,
+    tokenizer=tokenizer
+)
+
+trainer.train()
+```
+
+## Memory and Compute Benefits
+
+- **Memory**: ~50% reduction compared to full attention at 8K context
+- **Speed**: 2-4x faster than standard attention for long sequences
+- **Scalability**: Maintains efficiency as sequence length increases
+- **Quality**: Minimal perplexity degradation compared to full attention
+
+## Common Issues
+
+1. **OOM**: Reduce batch_size or use gradient_checkpointing=True
+2. **Compilation**: First run may be slow due to Triton kernel compilation
+3. **Sequence Length**: Ensure max_position_embeddings ≥ training sequence length
+4. **Device**: Requires CUDA-compatible GPU with compute capability ≥ 7.0
