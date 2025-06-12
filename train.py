@@ -13,11 +13,11 @@ import numpy as np
 import torch
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
-import transformers
 import tiktoken
 from model import GPT #, GPTConfig
 from dataclasses import dataclass
-# import torch._dynamo as dynamo
+
+from muon import SingleDeviceMuonWithAuxAdam
 
 # -----------------------------------------------------------------------------
 @dataclass
@@ -42,9 +42,9 @@ class TrainConfig():
 
     # data
     dataset = 'openwebtext'
-    gradient_accumulation_steps = 8 
-    batch_size = 16 
-    block_size = 1024
+    gradient_accumulation_steps = 4 
+    batch_size = 12 
+    block_size = 2048
 
     # model
     n_layer = 12
@@ -54,8 +54,9 @@ class TrainConfig():
     bias = False 
     vocab_size = 50304 # GPT-2 vocab_size of 50257, padded up to nearest multiple of 64 for efficiency
     is_inference = False
+    compile = True
 
-    # adamw optimizer
+    # muon and adamw optimizer
     max_steps = 600000 # total number of training steps
     learning_rate = 3e-3 # max learning rate
     weight_decay = 1e-1
@@ -76,7 +77,6 @@ class TrainConfig():
     # system
     device = 'cuda'
     dtype = 'bfloat16' if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else 'float16' 
-    compile = True
 
 # -----------------------------------------------------------------------------
 def get_batch(args, split, data_dir, device_type):
@@ -125,6 +125,7 @@ def get_lr(args, it):
     assert 0 <= decay_ratio <= 1
     coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio)) # coeff ranges 0..1
     return args.min_lr + coeff * (args.learning_rate - args.min_lr)
+
 
 # -----------------------------------------------------------------------------
 def main(train_args):
@@ -307,7 +308,6 @@ def main(train_args):
             # clip the gradient
             if args.grad_clip != 0.0:
                 torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
-            # step the optimizer and scaler if training in fp16
             optimizer.step()
             # flush the gradients as soon as we can, no need for this memory anymore
             optimizer.zero_grad(set_to_none=True)
