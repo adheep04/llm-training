@@ -17,15 +17,15 @@ import tiktoken
 from model import GPT #, GPTConfig
 from dataclasses import dataclass
 
-from muon import SingleDeviceMuonWithAuxAdam
+from muon_adam_polar import SingleDeviceMuonWithAuxAdam
 
 # -----------------------------------------------------------------------------
 @dataclass
 class TrainConfig():
     eval_interval = 2000
-    out_dir = 'out'
     eval_steps = 200
-    eval_only = False # if True, script exits right after the first eval
+    out_dir = 'out'
+    eval_only = False 
     always_save_checkpoint = True # if True, always save a checkpoint after each eval
     init_from = 'scratch' # 'scratch' or 'resume' or 'gpt2*'
     begin_with_eval = False
@@ -33,9 +33,10 @@ class TrainConfig():
     # logging
     log_interval = 1
     log_time = True
-    wandb_log = False
-    wandb_project = 'owt'
-    wandb_run_name = 'gpt2' # 'run' + str(time.time())
+    wandb_log = True
+    wandb_project = 'optim_experiments'
+    wandb_run_name = 'nanoGPT-muon-1' # 'run' + str(time.time())
+    print_log = True
     log_input_text = True
     log_text_interval = 200
     log_text_length = 400
@@ -58,17 +59,16 @@ class TrainConfig():
 
     # muon and adamw optimizer
     max_steps = 600000 # total number of training steps
-    learning_rate = 3e-3 # max learning rate
+    adam_max_lr = 3e-4 # max learning rate
+    adam_min_lr = 1e-5 #  should be ~= learning_rate/10 per Chinchilla
+    muon_lr = 0.02
     weight_decay = 1e-1
-    beta1 = 0.9
-    beta2 = 0.95
+    betas = (0.9, 0.95)
+    momentum = 0.95
+    eps = 1e-10
     grad_clip = 1.0 # disable if == 0.0
-
-    # learning rate decay settings
-    decay_lr = True 
     warmup_steps = 2000 
     lr_decay_steps = 600000 # should be ~= max_steps per Chinchilla
-    min_lr = 1e-4 #  should be ~= learning_rate/10 per Chinchilla
 
     # training
     cce = True
@@ -96,36 +96,24 @@ def get_batch(args, split, data_dir, device_type):
         x, y = x.to(args.device), y.to(args.device)
     return x, y
 
-# helps estimate an arbitrarily accurate loss over either split using many batches
-@torch.no_grad()
-def estimate_loss(args, model, ctx, data_dir, device_type):
-    out = {}
-    model.eval()
-    for split in ['train', 'val']:
-        losses = torch.zeros(args.eval_steps)
-        for k in range(args.eval_steps):
-            X, Y = get_batch(args, split, data_dir, device_type)
-            with ctx:
-                loss = model(X, Y)
-            losses[k] = loss.item()
-        out[split] = losses.mean()
-    model.train()
-    return out
+def configure_optimizers(model, args):
+    param_dict = {pn: p for pn, p in model.named_parameters()}
+    param_dict = {pn: p for pn, p in param_dict.items() if p.requires_grad}
+    # create optim groups. Any parameters that is 2D will be weight decayed, otherwise no.
+    # i.e. all weight tensors in matmuls + embeddings decay, all biases and layernorms don't.
+    muon_params = [p for n, p in param_dict.items() if p.dim() >= 2]
+    adamw_params = [p for n, p in param_dict.items() if p.dim() < 2]
+    optim_groups = [
+        {'params': muon_params, 'use_muon': True, 'lr': args.muon_lr, 'momentum': args.muon_lr, 'weight_decay': args.weight_decay},
+        {'params': adamw_params,'use_muon': False, 'lr': args.adam_max_lr, 'betas': args.betas, 'eps': args.eps, 'weight_decay': 0.0}
+    ]
+    n_params_muon = sum(p.numel() for p in muon_params)
+    n_params_adamw = sum(p.numel() for p in adamw_params)
+    print(f"muon params (2d): {n_params_muon/1e6}")
+    print(f"adamw params (2d): {n_params_adamw/1e6}")
 
-# learning rate decay scheduler (cosine with warmup)
-def get_lr(args, it):
-    # 1) linear warmup for warmup_iters steps
-    if it < args.warmup_steps:
-        return args.learning_rate * (it + 1) / (args.warmup_steps + 1)
-    # 2) if it > lr_decay_steps, return min learning rate
-    if it > args.lr_decay_steps:
-        return args.min_lr
-    # 3) in between, use cosine decay down to min learning rate
-    decay_ratio = (it - args.warmup_steps) / (args.lr_decay_steps - args.warmup_steps)
-    assert 0 <= decay_ratio <= 1
-    coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio)) # coeff ranges 0..1
-    return args.min_lr + coeff * (args.learning_rate - args.min_lr)
-
+    muon_adamw_optimizer = SingleDeviceMuonWithAuxAdam(param_groups=optim_groups)
+    return muon_adamw_optimizer
 
 # -----------------------------------------------------------------------------
 def main(train_args):
@@ -204,7 +192,7 @@ def main(train_args):
         model.to(args.device).to(dtype=ptdtype)
 
         # optimizer
-        optimizer = model.configure_optimizers(args.weight_decay, args.learning_rate, (args.beta1, args.beta2), device_type)
+        optimizer = configure_optimizers(model, args)
         if args.init_from == 'resume':
             optimizer.load_state_dict(checkpoint['optimizer'])
         checkpoint = None # free up memory
@@ -218,13 +206,13 @@ def main(train_args):
         # logging
         if args.wandb_log:
             import wandb
-            wandb.init(project=args.wandb_project, name=args.wandb_run_name, config=config)
+            wandb.init(project=args.wandb_project, name=args.wandb_run_name, config=model_args)
 
         # -----------------------------------------------------------------------------
         X, Y = get_batch(args, 'train', data_dir, device_type) # fetch the very first batch
         if args.log_time: 
             t0 = time.time() 
-        local_step = 0 # number of iterations in the lifetime of this process
+            training_start_time = time.time()
         raw_model = model # unwrap DDP container if needed
         enc = tiktoken.get_encoding("gpt2")
         running_mfu = -1.0
@@ -236,11 +224,6 @@ def main(train_args):
         best_val_loss = 1e9
 
         while True:
-            # determine and set the learning rate for this step
-            lr = get_lr(args, step) if args.decay_lr else args.learning_rate
-            for param_group in optimizer.param_groups:
-                param_group['lr'] = lr
-
             # evaluate the loss on train/val sets and write checkpoints
             if step % args.eval_interval == 0 and (step != 0 or args.begin_with_eval):
                 with torch.no_grad():
@@ -264,7 +247,8 @@ def main(train_args):
                         "step": step,
                         "train/loss": losses['train'],
                         "val/loss": losses['val'],
-                        "lr": lr,
+                        "muon_lr": args.muon_lr,
+                        "adamw_lr": args.adam_max_lr,
                         "mfu": running_mfu*100, # convert to percentage
                     })
                 if losses['val'] < best_val_loss or args.always_save_checkpoint:
@@ -329,10 +313,22 @@ def main(train_args):
             if step % args.log_interval == 0:
                 # get loss as float. note: this is a CPU-GPU sync point
                 # scale up to undo the division above, approximating the true total loss (exact would have been a sum)
-                lossf = loss.item() * args.gradient_accumulation_steps
-                print(f"step {step}: loss {lossf:.4f}, time {time_str} ms/step, {tokens_per_sec} tokens/s, mfu {running_mfu*100:.2f}%")
+                if args.print_log or args.wandb_log:
+                    lossf = loss.item() * args.gradient_accumulation_steps
+
+                if args.print_log:
+                    print(f"step {step}: loss {lossf:.4f}, time {time_str} ms/step, {tokens_per_sec} tokens/s, mfu {running_mfu*100:.2f}%") 
+
+                if args.wandb_log: 
+                    wandb.log({
+                        "optim_step": step // args.gradient_accumulation_steps,
+                        "train/loss": lossf,
+                        "muon_lr": args.muon_lr,
+                        "adamw_lr": args.adam_max_lr,
+                        "mfu": running_mfu*100, # convert to percentage
+                        **({'elapsed_time' : time.time() - training_start_time} if args.log_time else {}) 
+                    })
             step += 1
-            local_step += 1
 
             # termination conditions
             if step > args.max_steps:
@@ -355,7 +351,7 @@ def main(train_args):
 if __name__ == '__main__':
     # -----------------------------------------------------------------------------
     config_keys = [k for k,v in globals().items() if not k.startswith('_') and isinstance(v, (int, float, bool, str))]
-    exec(open('configurator.py').read()) # overrides from command line or config file
+    # exec(open('configurator.py').read()) # overrides from command line or config file
     config = {k: globals()[k] for k in config_keys} # will be useful for logging
     # -----------------------------------------------------------------------------
     # dynamo.config.capture_dynamic_output_shape_ops = True
