@@ -13,11 +13,9 @@ import numpy as np
 import torch
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
-import transformers
 import tiktoken
 from model import GPT #, GPTConfig
 from dataclasses import dataclass
-# import torch._dynamo as dynamo
 
 # -----------------------------------------------------------------------------
 @dataclass
@@ -35,7 +33,7 @@ class TrainConfig():
     log_time = True
     wandb_log = True
     wandb_project = 'baseline-nanogpt'
-    wandb_run_name = 'nanoGPT-adam-1' # 'run' + str(time.time())
+    wandb_run_name = 'nanoGPT-adam-1' + str(time.time())
     print_log = True
     log_input_text = True
     log_text_interval = 200
@@ -225,6 +223,7 @@ def main(train_args):
         if args.log_time: 
             t0 = time.time() 
             training_start_time = time.time()
+
         local_step = 0 # number of iterations in the lifetime of this process
         raw_model = model # unwrap DDP container if needed
         enc = tiktoken.get_encoding("gpt2")
@@ -293,9 +292,6 @@ def main(train_args):
                     # cce doesn't materialize raw logits
                     if args.cce:
                         loss = model(X, Y)
-                        while True:
-                            import code; code.interact(local=locals())
-                            break
                     else:
                         logits, loss = model(X, Y)
                     if micro_step == 0 and step % args.log_text_interval == 0:
@@ -347,9 +343,10 @@ def main(train_args):
                         "train/loss": lossf,
                         "lr": lr,
                         "mfu": running_mfu*100, # convert to percentage
-                        "tokens": trained_token_count,
                         **({'elapsed_time' : time.time() - training_start_time} if args.log_time else {}),
-                        'toke_per_sec' : tokens_per_sec
+                        "tokens": trained_token_count,
+                        'tokens_per_sec' : tokens_per_step / dt,
+                        'perplexity' : torch.exp(lossf)
                     })
                 lossf = loss.item() * args.gradient_accumulation_steps
             step += 1
