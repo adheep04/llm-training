@@ -225,7 +225,9 @@ def main(train_args):
         trained_token_count = 0
 
         while True:
-            # evaluate the loss on train/val sets and write checkpoints
+
+            # validation 
+            # -----------------------------------------------------------------------------
             if step % args.eval_interval == 0 and (step != 0 or args.begin_with_eval):
                 with torch.no_grad():
                     losses = {}
@@ -267,10 +269,9 @@ def main(train_args):
                         torch.save(checkpoint, os.path.join(args.out_dir, 'ckpt.pt'))
             if step == 0 and args.eval_only:
                 break
-            # -----------------------------------------------------------------------------
-            # training
 
-            # forward backward update, with optional gradient accumulation to simulate larger batch size
+            # training
+            # -----------------------------------------------------------------------------
             for micro_step in range(args.gradient_accumulation_steps):
                 with ctx:
                     # cce doesn't materialize raw logits
@@ -298,27 +299,28 @@ def main(train_args):
             optimizer.zero_grad(set_to_none=True)
             trained_token_count += tokens_per_step
 
+
             # timing and logging
-            if args.log_time:
-                torch.cuda.synchronize()
-                t1 = time.time()
-                dt = t1 - t0
-                t0 = t1
-                mfu = raw_model.estimate_mfu(args.batch_size * args.gradient_accumulation_steps, dt)
-                running_mfu = mfu if running_mfu == -1.0 else 0.9*running_mfu + 0.1*mfu
-                time_str = f"{dt*1000:.2f}" 
-                tokens_per_sec = f"{tokens_per_step / dt:.2f}" 
-            else:
-                dt = None
-                tokens_per_sec = "N/A"
-                time_str = "N/A"
+            # -----------------------------------------------------------------------------
             if step % args.log_interval == 0:
                 # get loss as float. note: this is a CPU-GPU sync point
                 # scale up to undo the division above, approximating the true total loss (exact would have been a sum)
                 if args.print_log or args.wandb_log:
                     lossf = loss.item() * args.gradient_accumulation_steps
+                if args.log_time:
+                    t1 = time.time()
+                    dt = t1 - t0
+                    t0 = t1
+                    mfu = raw_model.estimate_mfu(args.batch_size * args.gradient_accumulation_steps, dt)
+                    running_mfu = mfu if running_mfu == -1.0 else 0.9*running_mfu + 0.1*mfu
+                    time_str = f"{dt*1000:.2f}" 
+                    tokens_per_sec = tokens_per_step / dt
+                else:
+                    dt = None
+                    tokens_per_sec = "N/A"
+                    time_str = "N/A"
                 if args.print_log:
-                    print(f"step {step}: loss {lossf:.4f}, time {time_str} ms/step, {tokens_per_sec} tokens/s, mfu {running_mfu*100:.2f}%") 
+                    print(f"step {step}: loss {lossf:.4f}, time {time_str} ms/step, {tokens_per_sec:.2f} tokens/s, mfu {running_mfu*100:.2f}%") 
                 if args.wandb_log: 
                     wandb.log({
                         "optim_step": step // args.gradient_accumulation_steps,
@@ -326,9 +328,10 @@ def main(train_args):
                         "muon_lr": args.muon_lr,
                         "adamw_lr": args.adam_max_lr,
                         "mfu": running_mfu*100, # convert to percentage
-                        **({'elapsed_time' : time.time() - training_start_time} if args.log_time else {}) ,
+                        # **({'elapsed_time' : time.time() - training_start_time} if args.log_time else {}) ,
                         "tokens" : trained_token_count,
-                        'tokens_per_sec' : tokens_per_step / dt
+                        'tokens_per_sec' : tokens_per_sec,
+                        'perplexity' : torch.exp(lossf)
                     })
             step += 1
 
