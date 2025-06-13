@@ -222,6 +222,7 @@ def main(train_args):
         # init these up here, can override if init_from='resume' (i.e. from a checkpoint)
         step = 0
         best_val_loss = 1e9
+        trained_token_count = 0
 
         while True:
             # evaluate the loss on train/val sets and write checkpoints
@@ -295,6 +296,7 @@ def main(train_args):
             optimizer.step()
             # flush the gradients as soon as we can, no need for this memory anymore
             optimizer.zero_grad(set_to_none=True)
+            trained_token_count += tokens_per_step
 
             # timing and logging
             if args.log_time:
@@ -315,10 +317,8 @@ def main(train_args):
                 # scale up to undo the division above, approximating the true total loss (exact would have been a sum)
                 if args.print_log or args.wandb_log:
                     lossf = loss.item() * args.gradient_accumulation_steps
-
                 if args.print_log:
                     print(f"step {step}: loss {lossf:.4f}, time {time_str} ms/step, {tokens_per_sec} tokens/s, mfu {running_mfu*100:.2f}%") 
-
                 if args.wandb_log: 
                     wandb.log({
                         "optim_step": step // args.gradient_accumulation_steps,
@@ -326,7 +326,9 @@ def main(train_args):
                         "muon_lr": args.muon_lr,
                         "adamw_lr": args.adam_max_lr,
                         "mfu": running_mfu*100, # convert to percentage
-                        **({'elapsed_time' : time.time() - training_start_time} if args.log_time else {}) 
+                        **({'elapsed_time' : time.time() - training_start_time} if args.log_time else {}) ,
+                        "tokens" : trained_token_count,
+                        'tokens_per_sec' : tokens_per_step / dt
                     })
             step += 1
 
