@@ -18,7 +18,6 @@ from cut_cross_entropy import linear_cross_entropy
 class GPT(nn.Module):
     def __init__(self, config):
         super().__init__()
-        assert config.vocab_size is not None
         assert config.block_size is not None
         self.config = config
         self.cce = config.cce

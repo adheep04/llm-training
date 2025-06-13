@@ -11,3 +11,5 @@ input.txt
 env/
 venv/
 backups/
+wandb/
+info.txt

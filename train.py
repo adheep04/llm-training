@@ -23,8 +23,8 @@ from dataclasses import dataclass
 @dataclass
 class TrainConfig():
     eval_interval = 2000
-    out_dir = 'out'
     eval_steps = 200
+    out_dir = 'out'
     eval_only = False # if True, script exits right after the first eval
     always_save_checkpoint = True # if True, always save a checkpoint after each eval
     init_from = 'scratch' # 'scratch' or 'resume' or 'gpt2*'
@@ -33,18 +33,19 @@ class TrainConfig():
     # logging
     log_interval = 1
     log_time = True
-    wandb_log = False
-    wandb_project = 'owt'
-    wandb_run_name = 'gpt2' # 'run' + str(time.time())
+    wandb_log = True
+    wandb_project = 'baseline-nanogpt'
+    wandb_run_name = 'nanoGPT-adam-1' # 'run' + str(time.time())
+    print_log = True
     log_input_text = True
     log_text_interval = 200
     log_text_length = 400
 
     # data
     dataset = 'openwebtext'
-    gradient_accumulation_steps = 8 
-    batch_size = 16 
-    block_size = 1024
+    gradient_accumulation_steps = 4 
+    batch_size = 12 
+    block_size = 2048
 
     # model
     n_layer = 12
@@ -61,7 +62,7 @@ class TrainConfig():
     weight_decay = 1e-1
     beta1 = 0.9
     beta2 = 0.95
-    grad_clip = 1.0 # disable if == 0.0
+    grad_clip = 1.0 
 
     # learning rate decay settings
     decay_lr = True 
@@ -223,6 +224,7 @@ def main(train_args):
         X, Y = get_batch(args, 'train', data_dir, device_type) # fetch the very first batch
         if args.log_time: 
             t0 = time.time() 
+            training_start_time = time.time()
         local_step = 0 # number of iterations in the lifetime of this process
         raw_model = model # unwrap DDP container if needed
         enc = tiktoken.get_encoding("gpt2")
@@ -233,6 +235,7 @@ def main(train_args):
         # init these up here, can override if init_from='resume' (i.e. from a checkpoint)
         step = 0
         best_val_loss = 1e9
+        trained_token_count = 0
 
         while True:
             # determine and set the learning rate for this step
@@ -290,6 +293,9 @@ def main(train_args):
                     # cce doesn't materialize raw logits
                     if args.cce:
                         loss = model(X, Y)
+                        while True:
+                            import code; code.interact(local=locals())
+                            break
                     else:
                         logits, loss = model(X, Y)
                     if micro_step == 0 and step % args.log_text_interval == 0:
@@ -307,10 +313,10 @@ def main(train_args):
             # clip the gradient
             if args.grad_clip != 0.0:
                 torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
-            # step the optimizer and scaler if training in fp16
             optimizer.step()
             # flush the gradients as soon as we can, no need for this memory anymore
             optimizer.zero_grad(set_to_none=True)
+            trained_token_count += tokens_per_step
 
             # timing and logging
             if args.log_time:
@@ -329,8 +335,23 @@ def main(train_args):
             if step % args.log_interval == 0:
                 # get loss as float. note: this is a CPU-GPU sync point
                 # scale up to undo the division above, approximating the true total loss (exact would have been a sum)
+                if args.print_log or args.wandb_log:
+                    lossf = loss.item() * args.gradient_accumulation_steps
+
+                if args.print_log:
+                    print(f"step {step}: loss {lossf:.4f}, time {time_str} ms/step, {tokens_per_sec} tokens/s, mfu {running_mfu*100:.2f}%")
+
+                if args.wandb_log:
+                    wandb.log({
+                        "optim_step": step // args.gradient_accumulation_steps,
+                        "train/loss": lossf,
+                        "lr": lr,
+                        "mfu": running_mfu*100, # convert to percentage
+                        "tokens": trained_token_count,
+                        **({'elapsed_time' : time.time() - training_start_time} if args.log_time else {}),
+                        'toke_per_sec' : tokens_per_sec
+                    })
                 lossf = loss.item() * args.gradient_accumulation_steps
-                print(f"step {step}: loss {lossf:.4f}, time {time_str} ms/step, {tokens_per_sec} tokens/s, mfu {running_mfu*100:.2f}%")
             step += 1
             local_step += 1
 
