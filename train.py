@@ -35,17 +35,18 @@ class TrainConfig():
     log_time = True
     wandb_log = True
     wandb_project = 'optim_experiments'
-    wandb_run_name = 'nanoGPT-muon-1' # 'run' + str(time.time())
-    print_log = True
-    log_input_text = True
+    wandb_run_name = 'nanoGPT-muon-124m' + f'{str(time.time())}'[:10]
+    wandb_log_interval = 4
+    print_log = False
+    log_input_text = False
     log_text_interval = 200
     log_text_length = 400
 
     # data
     dataset = 'openwebtext'
-    gradient_accumulation_steps = 4 
-    batch_size = 12 
-    block_size = 2048
+    gradient_accumulation_steps = 8 
+    batch_size = 16 
+    block_size = 1024
 
     # model
     n_layer = 12
@@ -59,7 +60,7 @@ class TrainConfig():
 
     # muon and adamw optimizer
     max_steps = 600000 # total number of training steps
-    adam_max_lr = 3e-4 # max learning rate
+    adam_max_lr = 2e-4 # max learning rate
     adam_min_lr = 1e-5 #  should be ~= learning_rate/10 per Chinchilla
     muon_lr = 0.02
     weight_decay = 1e-1
@@ -101,16 +102,21 @@ def configure_optimizers(model, args):
     param_dict = {pn: p for pn, p in param_dict.items() if p.requires_grad}
     # create optim groups. Any parameters that is 2D will be weight decayed, otherwise no.
     # i.e. all weight tensors in matmuls + embeddings decay, all biases and layernorms don't.
-    muon_params = [p for n, p in param_dict.items() if p.dim() >= 2]
-    adamw_params = [p for n, p in param_dict.items() if p.dim() < 2]
+    import code; code.interact(local=locals())
+    muon_params = [p for n, p in param_dict.items() if p.dim() >= 2 and n not in 
+        ['transformer.wte.weight', 
+         'transformer.wpe.weight']]
+    adamw_params = [p for n, p in param_dict.items() if p.dim() < 2 or n in 
+        ['transformer.wte.weight', 
+         'transformer.wpe.weight']]
     optim_groups = [
         {'params': muon_params, 'use_muon': True, 'lr': args.muon_lr, 'momentum': args.muon_lr, 'weight_decay': args.weight_decay},
         {'params': adamw_params,'use_muon': False, 'lr': args.adam_max_lr, 'betas': args.betas, 'eps': args.eps, 'weight_decay': 0.0}
     ]
     n_params_muon = sum(p.numel() for p in muon_params)
     n_params_adamw = sum(p.numel() for p in adamw_params)
-    print(f"muon params (2d): {n_params_muon/1e6}")
-    print(f"adamw params (2d): {n_params_adamw/1e6}")
+    print(f"muon params (2d): {n_params_muon:,}")
+    print(f"adamw params (2d): {n_params_adamw:,}")
 
     muon_adamw_optimizer = SingleDeviceMuonWithAuxAdam(param_groups=optim_groups)
     return muon_adamw_optimizer
@@ -279,13 +285,6 @@ def main(train_args):
                         loss = model(X, Y)
                     else:
                         logits, loss = model(X, Y)
-                    if micro_step == 0 and step % args.log_text_interval == 0:
-                        print("\n----- GROUND-TRUTH -----")
-                        print(enc.decode((Y[0]).tolist())[:300], "\n")  # First 100 chars
-                        if not args.cce and 'logits' in locals():
-                            print("\n----- PREDICTED -----")
-                            print(enc.decode((logits[0,:,:50257].argmax(dim=-1)).tolist())[:300])
-                        print("-" * 40)
                     loss = loss / args.gradient_accumulation_steps # scale the loss to account for gradient accumulation
                 # immediately async prefetch next batch while model is doing the forward pass on the GPU
                 X, Y = get_batch(args, 'train', data_dir, device_type)
@@ -304,8 +303,8 @@ def main(train_args):
             # -----------------------------------------------------------------------------
             if step % args.log_interval == 0:
                 # get loss as float. note: this is a CPU-GPU sync point
-                # scale up to undo the division above, approximating the true total loss (exact would have been a sum)
                 if args.print_log or args.wandb_log:
+                    # scale up to undo the division above, approximating the true total loss (exact would have been a sum)
                     lossf = loss.item() * args.gradient_accumulation_steps
                 if args.log_time:
                     t1 = time.time()
@@ -319,9 +318,19 @@ def main(train_args):
                     dt = None
                     tokens_per_sec = "N/A"
                     time_str = "N/A"
+
                 if args.print_log:
                     print(f"step {step}: loss {lossf:.4f}, time {time_str} ms/step, {tokens_per_sec:.2f} tokens/s, mfu {running_mfu*100:.2f}%") 
-                if args.wandb_log: 
+
+                if args.log_input_text and step % args.log_text_interval == 0:
+                    print("\n----- GROUND-TRUTH -----")
+                    print(enc.decode((Y[0]).tolist())[:300], "\n")  # First 100 chars
+                    if not args.cce and 'logits' in locals():
+                        print("\n----- PREDICTED -----")
+                        print(enc.decode((logits[0,:,:50257].argmax(dim=-1)).tolist())[:300])
+                    print("-" * 40)
+                    
+                if args.wandb_log and step % args.wandb_log_interval == 0: 
                     wandb.log({
                         "optim_step": step // args.gradient_accumulation_steps,
                         "train/loss": lossf,
@@ -331,7 +340,7 @@ def main(train_args):
                         # **({'elapsed_time' : time.time() - training_start_time} if args.log_time else {}) ,
                         "tokens" : trained_token_count,
                         'tokens_per_sec' : tokens_per_sec,
-                        'perplexity' : torch.exp(lossf)
+                        'perplexity' : torch.exp(loss * args.gradient_accumulation_steps)
                     })
             step += 1
 
