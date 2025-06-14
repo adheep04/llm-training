@@ -102,7 +102,6 @@ def configure_optimizers(model, args):
     param_dict = {pn: p for pn, p in param_dict.items() if p.requires_grad}
     # create optim groups. Any parameters that is 2D will be weight decayed, otherwise no.
     # i.e. all weight tensors in matmuls + embeddings decay, all biases and layernorms don't.
-    import code; code.interact(local=locals())
     muon_params = [p for n, p in param_dict.items() if p.dim() >= 2 and n not in 
         ['transformer.wte.weight', 
          'transformer.wpe.weight']]
@@ -292,7 +291,7 @@ def main(train_args):
                 loss.backward()
             # clip the gradient
             if args.grad_clip != 0.0:
-                torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+                norm = torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
             optimizer.step()
             # flush the gradients as soon as we can, no need for this memory anymore
             optimizer.zero_grad(set_to_none=True)
@@ -306,6 +305,7 @@ def main(train_args):
                 if args.print_log or args.wandb_log:
                     # scale up to undo the division above, approximating the true total loss (exact would have been a sum)
                     lossf = loss.item() * args.gradient_accumulation_steps
+                    normf = norm.item()
                 if args.log_time:
                     t1 = time.time()
                     dt = t1 - t0
@@ -320,7 +320,7 @@ def main(train_args):
                     time_str = "N/A"
 
                 if args.print_log:
-                    print(f"step {step}: loss {lossf:.4f}, time {time_str} ms/step, {tokens_per_sec:.2f} tokens/s, mfu {running_mfu*100:.2f}%") 
+                    print(f"step {step}: loss {lossf:.4f}, time {time_str} ms/step, {tokens_per_sec:.2f} tokens/s, grad_norm {normf:.4f}, mfu {running_mfu*100:.2f}%") 
 
                 if args.log_input_text and step % args.log_text_interval == 0:
                     print("\n----- GROUND-TRUTH -----")
@@ -340,7 +340,8 @@ def main(train_args):
                         # **({'elapsed_time' : time.time() - training_start_time} if args.log_time else {}) ,
                         "tokens" : trained_token_count,
                         'tokens_per_sec' : tokens_per_sec,
-                        'perplexity' : torch.exp(loss * args.gradient_accumulation_steps)
+                        'perplexity' : torch.exp(loss * args.gradient_accumulation_steps),
+                        'grad_norm' : normf
                     })
             step += 1
 
