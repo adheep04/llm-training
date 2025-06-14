@@ -34,16 +34,17 @@ class TrainConfig():
     wandb_log = True
     wandb_project = 'baseline-nanogpt'
     wandb_run_name = 'nanoGPT-adam-1' + str(time.time())
-    print_log = True
+    print_log = False
+    print_text = False
     log_input_text = True
     log_text_interval = 200
     log_text_length = 400
 
     # data
     dataset = 'openwebtext'
-    gradient_accumulation_steps = 4 
-    batch_size = 12 
-    block_size = 2048
+    gradient_accumulation_steps = 8 
+    batch_size = 16 
+    block_size = 1024
 
     # model
     n_layer = 12
@@ -56,7 +57,7 @@ class TrainConfig():
 
     # adamw optimizer
     max_steps = 600000 # total number of training steps
-    learning_rate = 3e-3 # max learning rate
+    learning_rate = 2e-4 # max learning rate
     weight_decay = 1e-1
     beta1 = 0.9
     beta2 = 0.95
@@ -194,7 +195,6 @@ def main(train_args):
             step = checkpoint['step']
             best_val_loss = checkpoint['best_val_loss']
 
-
         # crop down the model block size if desired, using model surgery
         if args.block_size < model.config.block_size:
             model.crop_block_size(args.block_size)
@@ -294,13 +294,6 @@ def main(train_args):
                         loss = model(X, Y)
                     else:
                         logits, loss = model(X, Y)
-                    if micro_step == 0 and step % args.log_text_interval == 0:
-                        print("\n----- GROUND-TRUTH -----")
-                        print(enc.decode((Y[0]).tolist())[:300], "\n")  # First 100 chars
-                        if not args.cce and 'logits' in locals():
-                            print("\n----- PREDICTED -----")
-                            print(enc.decode((logits[0,:,:50257].argmax(dim=-1)).tolist())[:300])
-                        print("-" * 40)
                     loss = loss / args.gradient_accumulation_steps # scale the loss to account for gradient accumulation
                 # immediately async prefetch next batch while model is doing the forward pass on the GPU
                 X, Y = get_batch(args, 'train', data_dir, device_type)
@@ -337,6 +330,13 @@ def main(train_args):
                 if args.print_log:
                     print(f"step {step}: loss {lossf:.4f}, time {time_str} ms/step, {tokens_per_sec} tokens/s, mfu {running_mfu*100:.2f}%")
 
+                if args.print_text and step % args.log_text_interval == 0:
+                    print("\n----- GROUND-TRUTH -----")
+                    print(enc.decode((Y[0]).tolist())[:300], "\n")  # First 100 chars
+                    if not args.cce and 'logits' in locals():
+                        print("\n----- PREDICTED -----")
+                        print(enc.decode((logits[0,:,:50257].argmax(dim=-1)).tolist())[:300])
+                    print("-" * 40)
                 if args.wandb_log:
                     wandb.log({
                         "optim_step": step // args.gradient_accumulation_steps,
@@ -346,7 +346,7 @@ def main(train_args):
                         **({'elapsed_time' : time.time() - training_start_time} if args.log_time else {}),
                         "tokens": trained_token_count,
                         'tokens_per_sec' : tokens_per_step / dt,
-                        'perplexity' : torch.exp(lossf)
+                        'perplexity' : torch.exp(loss * args.gradient_accumulation_steps)
                     })
                 lossf = loss.item() * args.gradient_accumulation_steps
             step += 1
