@@ -13,3 +13,5 @@ venv/
 backups/
 info.txt
 wandb/
+TODO.txt
+data/

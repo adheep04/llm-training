@@ -22,30 +22,37 @@ from muon_adam_polar import SingleDeviceMuonWithAuxAdam
 # -----------------------------------------------------------------------------
 @dataclass
 class TrainConfig():
-    eval_interval = 2000
+    # training true / false options
+    eval_only = False 
+    begin_with_eval = False
+    log_time = True
+    wandb_log = False
+    print_log = True
+    log_input_text = False
+    is_inference = False
+    always_save_checkpoint = False # if True, always save a checkpoint after each eval
+    compile = True
+    decay_lr = True
+    cce = True
+    training = True
+
+    eval_interval = 50
     eval_steps = 200
     out_dir = 'out'
-    eval_only = False 
-    always_save_checkpoint = True # if True, always save a checkpoint after each eval
     init_from = 'scratch' # 'scratch' or 'resume' or 'gpt2*'
-    begin_with_eval = False
 
     # logging
     log_interval = 1
-    log_time = True
-    wandb_log = True
     wandb_project = 'optim_experiments'
-    wandb_run_name = 'nanoGPT-muon-124m' + f'{str(time.time())}'[:10]
+    wandb_run_name = 'muon-124m' 
     wandb_log_interval = 4
-    print_log = False
-    log_input_text = False
     log_text_interval = 200
     log_text_length = 400
 
     # data
     dataset = 'openwebtext'
-    gradient_accumulation_steps = 8 
-    batch_size = 16 
+    gradient_accumulation_steps = 4 
+    batch_size = 32
     block_size = 1024
 
     # model
@@ -55,25 +62,20 @@ class TrainConfig():
     dropout = 0.0 # for pretraining 0 is good, for finetuning try 0.1+
     bias = False 
     vocab_size = 50304 # GPT-2 vocab_size of 50257, padded up to nearest multiple of 64 for efficiency
-    is_inference = False
-    compile = True
 
     # muon and adamw optimizer
-    max_steps = 600000 # total number of training steps
-    adam_max_lr = 2e-4 # max learning rate
-    adam_min_lr = 1e-5 #  should be ~= learning_rate/10 per Chinchilla
+    max_steps = 8000 # total number of training steps
+    adam_lr = 2e-4 # max learning rate
     muon_lr = 0.02
-    weight_decay = 1e-1
+    muon_weight_decay = 1e-2
+    embed_weight_decay = 1e-1
     betas = (0.9, 0.95)
     momentum = 0.95
     eps = 1e-10
     grad_clip = 1.0 # disable if == 0.0
-    warmup_steps = 2000 
-    lr_decay_steps = 600000 # should be ~= max_steps per Chinchilla
-
-    # training
-    cce = True
-    training = True
+    muon_clip_mult = 2.0
+    warmup_steps = max_steps // 640 
+    lr_decay_steps = max_steps # should be ~= max_steps per Chinchilla
 
     # system
     device = 'cuda'
@@ -97,6 +99,15 @@ def get_batch(args, split, data_dir, device_type):
         x, y = x.to(args.device), y.to(args.device)
     return x, y
 
+def split_fused_weights(d_model, param_list):
+    p_split = []
+    for p in param_list:
+        if p.shape == (d_model * 3, d_model):
+            p_split += [*p.split(d_model, dim=0)]
+        else:
+            p_split.append(p)
+    return p_split
+
 def configure_optimizers(model, args):
     param_dict = {pn: p for pn, p in model.named_parameters()}
     param_dict = {pn: p for pn, p in param_dict.items() if p.requires_grad}
@@ -105,20 +116,45 @@ def configure_optimizers(model, args):
     muon_params = [p for n, p in param_dict.items() if p.dim() >= 2 and n not in 
         ['transformer.wte.weight', 
          'transformer.wpe.weight']]
-    adamw_params = [p for n, p in param_dict.items() if p.dim() < 2 or n in 
+    non_decay_params = [p for n, p in param_dict.items() if p.dim() < 2 and n not in 
+        ['transformer.wte.weight', 
+         'transformer.wpe.weight']]
+    embed_params = [p for n, p in param_dict.items() if n in 
         ['transformer.wte.weight', 
          'transformer.wpe.weight']]
     optim_groups = [
-        {'params': muon_params, 'use_muon': True, 'lr': args.muon_lr, 'momentum': args.muon_lr, 'weight_decay': args.weight_decay},
-        {'params': adamw_params,'use_muon': False, 'lr': args.adam_max_lr, 'betas': args.betas, 'eps': args.eps, 'weight_decay': 0.0}
+        {'params': muon_params, 'use_muon': True, 'lr': args.muon_lr, 'momentum': args.momentum, 'weight_decay': args.muon_weight_decay},
+        {'params': non_decay_params,'use_muon': False, 'lr': args.adam_lr, 'betas': args.betas, 'eps': args.eps, 'weight_decay': 0.0},
+        {'params': embed_params,'use_muon': False, 'lr': args.adam_lr, 'betas': args.betas, 'eps': args.eps, 'weight_decay': args.embed_weight_decay},
     ]
-    n_params_muon = sum(p.numel() for p in muon_params)
-    n_params_adamw = sum(p.numel() for p in adamw_params)
-    print(f"muon params (2d): {n_params_muon:,}")
-    print(f"adamw params (2d): {n_params_adamw:,}")
 
+    n_params_muon = sum(p.numel() for p in muon_params)
+    n_params_non_decay = sum(p.numel() for p in non_decay_params)
+    n_params_embed = sum(p.numel() for p in embed_params)
+
+    # muon needs individual q, k, v weights for effective optimization so i split the fused c_proj weights
+    # do it after taking param count intentionally so it doesn't triple count 
+    muon_params = split_fused_weights(args.d_model, muon_params)
+
+    print(f"muon params (2d): {n_params_muon:,}")
+    print(f"adamw params (embeddings): {n_params_embed:,}")
+    print(f"adamw params (1d): {n_params_non_decay:,}")
     muon_adamw_optimizer = SingleDeviceMuonWithAuxAdam(param_groups=optim_groups)
     return muon_adamw_optimizer
+
+# cosine lr scheduling with warmup
+def get_lr(args, it, max_lr, min_lr):
+    # 1) linear warmup for warmup_iters steps
+    if it < args.warmup_steps:
+        return max_lr * (it + 1) / (args.warmup_steps + 1)
+    # 2) if it > lr_decay_steps, return min learning rate
+    if it > args.lr_decay_steps:
+        return min_lr
+    # 3) in between, use cosine decay down to min learning rate
+    decay_ratio = (it - args.warmup_steps) / (args.lr_decay_steps - args.warmup_steps)
+    assert 0 <= decay_ratio <= 1
+    coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio)) # coeff ranges 0..1
+    return min_lr + coeff * (max_lr - min_lr)
 
 # -----------------------------------------------------------------------------
 def main(train_args):
@@ -217,7 +253,6 @@ def main(train_args):
         X, Y = get_batch(args, 'train', data_dir, device_type) # fetch the very first batch
         if args.log_time: 
             t0 = time.time() 
-            training_start_time = time.time()
         raw_model = model # unwrap DDP container if needed
         enc = tiktoken.get_encoding("gpt2")
         running_mfu = -1.0
@@ -230,6 +265,14 @@ def main(train_args):
         trained_token_count = 0
 
         while True:
+            # determine and set the learning rate for this step
+            curr_adam_lr = get_lr(args, step, args.adam_lr, args.adam_lr / 10) if args.decay_lr else args.adam_lr
+            curr_muon_lr = get_lr(args, step, args.muon_lr, args.muon_lr / 10) if args.decay_lr else args.muon_lr
+            for param_group in optimizer.param_groups:
+                if param_group['use_muon']:
+                    param_group['lr'] = curr_muon_lr
+                else:
+                    param_group['lr'] = curr_adam_lr
 
             # validation 
             # -----------------------------------------------------------------------------
@@ -237,9 +280,11 @@ def main(train_args):
                 with torch.no_grad():
                     losses = {}
                     model.eval()
+                    print('starting validation')
                     for split in ['train', 'val']:
                         batch_losses = torch.zeros(args.eval_steps)
                         for k in range(args.eval_steps):
+                            print(f'{k} / {args.eval_steps}')
                             X, Y = get_batch(args, split, data_dir, device_type)
                             if args.cce:
                                 loss = model(X, Y)
@@ -255,9 +300,11 @@ def main(train_args):
                         "step": step,
                         "train/loss": losses['train'],
                         "val/loss": losses['val'],
-                        "muon_lr": args.muon_lr,
-                        "adamw_lr": args.adam_max_lr,
+                        "muon_lr": curr_muon_lr,
+                        "adamw_lr": curr_adam_lr,
                         "mfu": running_mfu*100, # convert to percentage
+                        "tokens" : trained_token_count,
+                        'perplexity' : torch.exp(loss * args.gradient_accumulation_steps),
                     })
                 if losses['val'] < best_val_loss or args.always_save_checkpoint:
                     best_val_loss = losses['val']
@@ -266,9 +313,9 @@ def main(train_args):
                             'model': raw_model.state_dict(),
                             'optimizer': optimizer.state_dict(),
                             'model_args': model_args,
-                            'step': step,
+                            'step': step ,
                             'best_val_loss': best_val_loss,
-                            'config': config,
+                            'config': args,
                         }
                         print(f"saving checkpoint to {args.out_dir}")
                         torch.save(checkpoint, os.path.join(args.out_dir, 'ckpt.pt'))
@@ -291,7 +338,11 @@ def main(train_args):
                 loss.backward()
             # clip the gradient
             if args.grad_clip != 0.0:
-                norm = torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+                for p_group in optimizer.param_groups:
+                    if not p_group.get('use_muon', False): adam_params = p_group['params'] 
+                    if p_group.get('use_muon', False): muon_params = p_group['params'] 
+                norm = torch.nn.utils.clip_grad_norm_(adam_params, args.grad_clip)
+                norm = torch.nn.utils.clip_grad_norm_(muon_params, args.grad_clip * args.muon_clip_mult)
             optimizer.step()
             # flush the gradients as soon as we can, no need for this memory anymore
             optimizer.zero_grad(set_to_none=True)
@@ -334,14 +385,14 @@ def main(train_args):
                     wandb.log({
                         "optim_step": step // args.gradient_accumulation_steps,
                         "train/loss": lossf,
-                        "muon_lr": args.muon_lr,
-                        "adamw_lr": args.adam_max_lr,
+                        "muon_lr": curr_muon_lr,
+                        "adamw_lr": curr_adam_lr,
                         "mfu": running_mfu*100, # convert to percentage
-                        # **({'elapsed_time' : time.time() - training_start_time} if args.log_time else {}) ,
                         "tokens" : trained_token_count,
                         'tokens_per_sec' : tokens_per_sec,
                         'perplexity' : torch.exp(loss * args.gradient_accumulation_steps),
-                        'grad_norm' : normf
+                        'grad_norm' : normf,
+                        'step' : step * args.wandb_log_interval
                     })
             step += 1
 
@@ -358,7 +409,7 @@ def main(train_args):
         'model_args': model_args,
         'step': step,
         'best_val_loss': best_val_loss,
-        'config': config,
+        'config': args,
     }
     print(f"saving checkpoint to {args.out_dir}")
     torch.save(checkpoint, os.path.join(args.out_dir, 'ckpt.pt'))
